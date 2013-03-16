@@ -1,0 +1,33 @@
+LogDir: /tmp
+Debug: false
+Daemon: true
+
+CAPath: /etc/ssl/certs                              # for Debian
+# CAFile: /opt/local/share/curl/curl-ca-bundle.crt  # for MacPorts
+# CAFile: /usr/local/share/certs/ca-root-nss.crt
+# ProxyURI:
+
+Prowl:
+ APIKey: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+NMA:
+ APIKey: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+Growl:
+  Sticky: 0    # lowest priority to enable stikcy option
+
+Accounts:
+ -
+  Application: "Twitter"
+  User: your_tiwtter_id
+  RateLimitThreshold: 20
+  UseProxy: false      # <= use Prowl::ProxyURL
+  NotifyKeywordUpdates: true
+
+  NotifyMethods:
+    - "prowl" # Prowl for iPhone
+#   - "nma"   # Notify My Android for Android
+#   - "growl" # use growlnotify, it requires growl.gem and growlnotify
+
+  Redirect: "tweetbot:///status/%s"     # Tweetbot
+# Redirect: "twitter://status?id=%s"    # Twitter

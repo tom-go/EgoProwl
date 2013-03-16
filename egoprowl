@@ -1,0 +1,727 @@
+#!/usr/bin/env ruby
+# -*- coding: utf-8 -*-
+#
+# EgoProwl - Twitter Ego Search Notification Script with Prowl.
+#            This script is based on Twiprowl by takuo.
+#            https://github.com/takuo/TwiProwl
+# Version: 0.5
+#
+# Copyright (c) 2013 tom-go
+#
+# You can redistribute it and/or modify it under the same term as Ruby.
+#
+
+STDOUT.sync = STDERR.sync = true
+
+require 'optparse'
+require 'net/https'
+require 'json'
+require 'uri'
+require 'yaml'
+require 'logger'
+require 'pstore'
+require 'thread'
+begin
+    require 'growl'
+    require 'fileutils'
+rescue LoadError
+end
+
+$:.unshift( File::dirname( __FILE__ ) )
+require 'compat'
+
+EGOPROWL_VERSION = "0.5"
+$0 = "EgoProwl/#{EGOPROWL_VERSION}"
+
+PIDFILE = File.join( ENV['HOME'], ".egoprowl.pid" )
+LOGFILE = "egoprowl.log"
+
+class EgoProwl
+    API_BASE = "https://api.twitter.com/1.1/"
+
+    PROWL_API_ADD    = "https://prowl.weks.net/publicapi/add"
+    NMA_API_NOTIFY   = "https://www.notifymyandroid.com/publicapi/notify"
+
+    STREAM_URL       = "https://stream.twitter.com/1.1/statuses/filter.json"
+    SEARCH_URL       = "#{API_BASE}search/tweets.json?q=%s&%s"
+    SAVED_SEARCH_URL = "#{API_BASE}saved_searches/list.json"
+
+    CONSUMER_KEY     = 'VWebEH6PaYwF3nRNHttA'
+    CONSUMER_SECRET  = 'Ykk1qnfbVyKcNTNHsDejrKSaysZxYDNRZ4W7NwWFw'
+    ACCESS_SITE      = 'https://api.twitter.com'
+
+    attr_accessor :stream_thread, :search_thread
+
+    @@mutex = Mutex.new
+
+    def initialize( global, config, logger )
+        @@conf = global
+        @@conf['ProxyURI'] = URI::parse( @@conf['ProxyURI'] ) if @@conf['ProxyURI']
+        @logger = logger
+        @application = config.key?( 'Application' ) ? config['Application'] : "Twitter"
+        @user = config['User']
+        @use_proxy = config['UseProxy']
+        @threshold = config.key?( 'RateLimitThreshold' ) ? config['RateLimitThreshold'] : 20
+        @first_load = true
+
+        @tmp_keywords = Hash.new
+        @currentSearchIDs = Array.new
+
+        @filterWords = Array.new
+        @searchWords = Array.new
+        @since_id = Hash.new
+
+        pdbfile = File.join( ENV['HOME'], ".egoprowl.pdb" )
+        begin
+            @pdb = PStore.new( pdbfile, true )
+        rescue
+            @pdb = PStore.new( pdbfile ) # ruby 1,8, but it's not thread safe
+        end
+        process_oauth( @user )
+        @shutdown = false
+        @@mutex.synchronize do
+            @pdb.transaction do
+                @pdb[:idnames] = Hash.new unless @pdb.root?( :idnames )
+            end
+        end
+        File.chmod( 0600, pdbfile )
+        @notify = config.key?('NotifyMethods') ? config['NotifyMethods'] : [ "prowl" ]
+        @redirect = config.key?('Redirect') ? config['Redirect'] : nil
+        @notify_updates = config.key?('NotifyKeywordUpdates') ? config['NotifyKeywordUpdates'] : true
+    end
+
+    @@conf = Hash.new
+
+    def process_oauth( user )
+        access_token = nil
+        access_token_secret = nil
+        unless @@conf[:auth]
+            @@mutex.synchronize do
+                @pdb.transaction do
+                    if @pdb.root?( :tokens ) and @pdb[ :tokens ][ user ]
+                        access_token = @pdb[ :tokens ][ user ][ :access_token ]
+                        access_token_secret = @pdb[ :tokens ][ user ][ :access_token_secret ]
+                    end
+                end
+            end
+        end
+        params = {
+         :site => ACCESS_SITE,
+         :proxy => @use_proxy ? @@conf["ProxyURI"] : nil
+        }
+
+        @consumer = OAuth::Consumer.new( CONSUMER_KEY, CONSUMER_SECRET, params )
+        begin
+            if access_token && access_token_secret
+                @access_token = OAuth::AccessToken.new(
+                    @consumer, access_token, access_token_secret
+                )
+            end
+        rescue
+             print "Failed to getting Access Token.\n"
+             @access_token = nil
+        end
+        unless @access_token
+            print "Enter the password for #{user}: "
+            revertstty = `stty -g` rescue nil
+            `stty -echo` rescue nil
+            pass = gets.chomp.strip
+            print "\n"
+            `stty #{revertstty}` rescue nil
+            begin
+                print "** Processing OAuth authorization for #{user}..."
+                @access_token = get_access_token( user, pass )
+                print " done.\n"
+                @@mutex.synchronize do
+                    @pdb.transaction do
+                        @pdb[ :tokens ] = Hash.new unless @pdb.root?( :tokens )
+                        @pdb[ :tokens ][ user ] = {
+                            :access_token => @access_token.token,
+                            :access_token_secret => @access_token.secret
+                        }
+                    end
+                end
+            rescue
+                print "\n\nError: Failed to OAuth due to wrong password or the server error.\n"
+                print "ErrorMessage: #{$!}\n"
+                File.unlink( PIDFILE ) rescue
+                exit 1
+            end
+        end
+        @token = OAuth::Token.new( @access_token.token, @access_token.secret )
+    end
+
+    def get_access_token( user, pass )
+        rt = @consumer.get_request_token
+        u = URI::parse rt.authorize_url
+        http = http_new( u, @use_proxy )
+        req = Net::HTTP::Post.new( u.request_uri )
+        res = http.request( req )
+        raise RuntimeError, "HTTP: #{res.code}" if res.code != "200"
+        at = ot = nil
+        res.body.each_line do |line|
+            if /name="authenticity_token" type="hidden" value="([^"]+)"/ =~ line
+                at = $1
+            end
+            if /name="oauth_token" type="hidden" value="([^"]+)"/ =~ line
+                ot = $1
+            end
+            break if at && ot
+        end
+        raise RuntimeError, "Could not get tokens" if at.nil? or ot.nil?
+        query = [ "authenticity_token=#{at}",
+                            "oauth_token=#{ot}",
+                            "session[username_or_email]=#{user}",
+                            "session[password]=#{pass}",
+                            "submit=Allow" ].join("&")
+        u = URI::parse( "https://api.twitter.com/oauth/authorize" )
+        res = http.post( u.request_uri, query )
+        raise RuntimeError, "HTTP: #{res.code}" if res.code != "200"
+        pin = nil
+        res.body.each_line do |line|
+            if line =~ /<code>(\d+)/
+                pin = $1
+                break
+            end
+        end
+        raise RuntimeError, "Could not get PIN" unless pin
+        if pin
+            token = rt.get_access_token( :oauth_verifier => pin )
+        end
+        return token
+    end
+
+
+    def post_escape( string )
+        string.gsub(/([^ a-zA-Z0-9_.-]+)/) do
+            '%' + $1.unpack('H2' * $1.bytesize).join('%').upcase
+        end.tr(' ', '+')
+    end
+
+    def unescape( text )
+        text.gsub( /&(amp|quot|gt|lt);/u ) do
+            match = $1.dup
+            case match
+            when 'amp'    then '&'
+            when 'quot' then '"'
+            when 'gt'     then '>'
+            when 'lt'     then '<'
+            else
+                "&#{match};"
+            end
+        end unless text.nil? || text.empty?
+    end
+
+    # logging
+    def _log( severity, str )
+        if @logger
+            @logger.add( severity, str, "#{@application}@#{@user}" )
+        else
+            format = "[%Y-%m-%d %H:%M:%S##{Process.pid}]" 
+            if severity == Logger::ERROR
+                STDERR.print Time.now.strftime( format ) + " #{@application}@#{@user} - #{str}\n"
+            else
+                print Time.now.strftime( format ) + " #{@application}@#{@user} - #{str}\n"
+            end
+        end
+    end
+
+    def debug(str)
+        _log(Logger::DEBUG, str)
+    end
+
+    def error(str)
+        _log(Logger::ERROR, str)
+    end
+
+    def info(str)
+        _log(Logger::INFO, str)
+    end
+
+    def http_new( uri, use_proxy = true )
+        if @@conf['ProxyURI'] and use_proxy
+            pu = @@conf['ProxyURI']
+            http = Net::HTTP::Proxy( pu.host, pu.port, pu.user, pu.password ).new( uri.host, uri.port )
+        else
+            http = Net::HTTP.new( uri.host, uri.port )
+        end
+        if uri.scheme == "https"
+            http.use_ssl = true
+            http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+            http.ca_path = @@conf['CAPath'] if @@conf['CAPath']
+            http.ca_file = @@conf['CAFile'] if @@conf['CAFile']
+        end
+        return http
+    end
+
+    def notify( icon, params = {}, source_user = nil )
+        @notify.each do |m|
+            Thread.new do
+                send( m, icon, params.dup, source_user ? source_user.dup : nil )
+            end
+        end
+    end
+
+    def growl( icon, params={}, user = nil )
+        growl_params = {}
+        if @@conf['Growl'].key?( 'Sticky' ) and
+             params[:priority] >= @@conf['Growl']['Sticky']
+            growl_params[:sticky] = true
+        end
+        growl_params[:title] = params[:event]
+        growl_params[:priority] = params[:priority]
+        message = params[:description]
+        info "Notify with Growl..."
+        begin
+            file = nil
+            if user
+                url = URI::parse( user['profile_image_url'] )
+                file = File.join( ENV["HOME"] , ".egoprowl", url.path )
+                @@mutex.synchronize do
+                    if not File.exist?( file )
+                        FileUtils.mkdir_p( File.dirname( file ) )
+                        http = Net::HTTP.new( url.host, url.port )
+                        image = http.get( url.path )
+                        if image.code == "200"
+                            open( file, "wb+" ) do |fp| fp.write image.body end
+                        end
+                    end
+                end # synchronize
+            end
+            growl_params[:image] = file if file and File.exist?( file )
+            Growl.notify( message, growl_params )
+        rescue
+            error "Error while growl notify #{$!}"
+        end
+        nil
+    end
+
+    def prowl( icon, params={}, user = nil )
+        params[:apikey] = @@conf['Prowl']['APIKey']
+        params[:description] = "#{icon} #{params[:description]}"
+        begin
+            info "Notify with Prowl..."
+            uri = URI::parse( PROWL_API_ADD )
+            http = http_new( uri  )
+            request = Net::HTTP::Post.new( uri.request_uri )
+            request.content_type = "application/x-www-form-urlencoded"
+            query = params.map do |key, val| "#{key}=#{post_escape(val.to_s)}" end
+            res = http.request( request, query.join( '&' ) )
+            debug "Prowl Response: #{res.code}"
+        rescue
+            error "Error while Prowling: #{$!}"
+        end
+    end
+
+    def nma( icon, params = {}, user = nil )
+        params[:apikey] = @@conf['NMA']['APIKey']
+        begin
+            info "Notify with NMA..."
+            uri = URI::parse( NMA_API_NOTIFY )
+            http = http_new( uri    )
+            request = Net::HTTP::Post.new( uri.request_uri )
+            request.content_type = "application/x-www-form-urlencoded"
+            query = params.map do |key, val| "#{key}=#{post_escape(val.to_s)}" end
+            res = http.request( request, query.join( '&' ) )
+            debug "NMA Response: #{res.code}"
+        rescue
+            error "Error while Prowling: #{$!}"
+        end
+    end
+
+    def get_json( url, auth = true )
+        uri = URI::parse( url )
+        begin
+            if auth
+                res = @access_token.get( url )
+            else
+                http = http_new( uri, @use_proxy )
+                req = Net::HTTP::Get.new( uri.request_uri )
+                res = http.request( req )
+            end
+            if res['X-RateLimit-Remaining']
+                debug (auth ? "Auth" : "IP" ) + " RateLimit: %d/%d Reset at %s" % [
+                     res['X-RateLimit-Remaining'],
+                     res['X-RateLimit-Limit'],
+                     Time.at(res['X-RateLimit-Reset'].to_i).strftime( "%Y-%m-%d %H:%M:%S" )
+                ]
+             @rate = res['X-RateLimit-Remaining'].to_i if auth
+            end
+        rescue
+            error "HTTP Get Error: #{$!}"
+            return [ nil, res ]
+        end
+        return res.code == "200" ? [ JSON::parse( res.body ), res ] : [ nil, res ]
+    end
+
+    def process_stream( json )
+        if json['user']
+            source = json['user']['screen_name']
+            sid = json['user']['id_str']
+            source_user = json['user']
+        elsif json['source']
+            source = json['source']['screen_name'] 
+            sid = json['source']['id_str']
+            source_user = json['source']
+        elsif message
+            source_user = message['sender']
+            sid = message['sender']['id_str']
+            source = message['sender']['screen_name']
+        else
+            source = nil
+        end
+
+        if source 
+            @@mutex.synchronize do
+                @pdb.transaction do
+                    @pdb[:idnames][sid] = source
+                end
+            end
+        end
+        desc = unescape( json['text'] )
+        tweetid = json['id_str']
+
+        debug "Prowling: %s %s" % [ "@#{source} says", desc ]
+
+        param = {:application=> @application,
+                 :event => "@#{source} says",
+                 :description => desc,
+                 :priority => 0 }
+        param[:url] = @redirect % tweetid if @redirect
+        notify( Unicode::E114, param, source_user)
+        return
+    end
+
+    def stream_monitor
+        debug "Checking with Streaming API."
+        uri = URI::parse( STREAM_URL )
+        http = http_new( uri, @use_proxy )
+
+        escaped = Array.new
+        @filterWords.each do |kw| escaped.push(post_escape(kw)) end
+        request_uri = uri.request_uri + "?track=" + escaped.each do |kw| "#{kw}" end.join("%2c")
+        #request_uri = uri.request_uri + "?track=" + @filterWords.each do |kw| "#{post_escape(kw)}" end.join("%2c")
+        debug "request_uri = #{request_uri}"
+
+        request = Net::HTTP::Get.new( request_uri )
+        request.oauth!( http, @consumer, @token )
+        @stream_error_count = 0
+        begin
+            buf = ''
+            http.request( request ) do |res|
+                raise RuntimeError, "Error on HTTP HTTP:#{res.code} #{res.to_s}" if res.code.to_i != 200
+                res.read_body do |str|
+                    buf << str
+                    @stream_error_count = 0
+                    buf.gsub!( /[\s\S]+?\r\n/ ) do |chunk|
+                        json = JSON::parse( chunk ) rescue next
+                        begin
+                            process_stream( json )
+                        rescue
+                            error( "BUG: error while process JSON" )
+                            error( $!.backtrace.join("\n") )
+                            error( $!.to_s )
+                        end
+                    end
+                end
+            end
+        ensure
+            http.finish
+        end
+    end
+
+    def search_publicTL( reqstr )
+        reqstr.each do |kw|
+            if @since_id.has_key?(kw)
+                url = SEARCH_URL % [ post_escape(kw), "since_id=#{@since_id[kw]}"]
+            else
+                url = SEARCH_URL % [ post_escape(kw), "until=1900-01-01"]
+            end
+
+            json, res = get_json( url )
+            next if json.nil?
+
+            @since_id[kw] = json['search_metadata']['max_id']
+
+            json['statuses'].reverse.each do |obj|
+                source = obj['user']['screen_name']
+                tweetid = obj['id_str']
+                desc = obj['text']
+                desc.gsub!(/&(amp|quot|gt|lt);/u) do
+                    match = $1.dup
+                    case match
+                    when 'amp' then '&'
+                    when 'quot' then '"'
+                    when 'gt' then '>'
+                    when 'lt' then '<'
+                    else  "&#{match};"
+                    end
+                end
+                debug "Prowling: %s %s" % [ "@#{source} says", desc ]
+
+                param = {:application=> @application,
+                         :event => "@#{source} says",
+                         :description => desc,
+                         :priority => 0 }
+                param[:url] = @redirect % tweetid if @redirect
+                notify( Unicode::E114, param, source)
+
+            end
+
+            sleep 60
+        end
+    end
+
+    public
+    def stream_run
+        return if ( @stream_thread and @stream_thread.alive? ) or @shutdown
+        info "Starting streaming thread for \"#{@application}\"."
+        @stream_thread = Thread.new do
+            begin
+                stream_monitor
+            rescue
+                Thread.self.kill if @shutdown
+                error "Streaming Error: #{$!}"
+                debug "Stream error count=#{@stream_error_count}"
+                sleep 10 * (@stream_error_count += 1)
+                retry
+            end
+        end
+    end
+
+    def search_run
+        return if ( @search_thread and @search_thread.alive? ) or @shutdown
+        info "Starting search thread for \"#{@application}\"."
+        @search_thread = Thread.new do
+            loop do
+                begin
+                    search_publicTL( @searchWords )
+                rescue
+                    Thread.self.kill if @shutdown
+                    error "Search Error: #{$!}"
+                    debug "Search error count=#{@search_error_count}"
+                    sleep 10 * (@search_error_count += 1)
+                    retry
+                end
+                sleep 5
+            end #loop
+        end
+    end
+
+    def shutdown
+        @shutdown = true
+        info "Killing all threads by shutdown request."
+        (@stream_thread.kill; debug( "Streaming thread has been killed" )) if @stream_thread and @stream_thread.alive?
+        (@search_thread.kill; debug( "Search thread has been killed" )) if @search_thread and @search_thread.alive?
+    end
+
+    def get_saved_searches( auth = true )
+        debug "Getting Saved Searches..."
+        begin
+            json, res = get_json( SAVED_SEARCH_URL, auth )
+            if json.nil?
+                info "Couldn't get saved search queries..."
+                return
+            end
+
+            reloadSearch = false
+            reloadStream = false
+            newKeys = Array.new
+
+            json.each do |obj|
+                unless @tmp_keywords.has_key?(obj['id'])
+                    @tmp_keywords[obj['id']] = obj['query']
+                    debug "[id]#{obj['id']} [query]#{@tmp_keywords[obj['id']]}"
+                end
+                newKeys.push(obj['id'])
+            end
+
+            deletedKeys = @tmp_keywords.keys - newKeys
+            deletedKeys.each do |dKey|
+                kw = @tmp_keywords[dKey]
+                if ( @searchWords.index(kw) )
+                    @searchWords.delete(kw)
+                    reloadSearch = true
+                    debug "Deleted search keyword: #{kw}"
+                elsif ( @filterWords.index(kw) )
+                    @filterWords.delete(kw)
+                    reloadStream = true
+                    debug "Deleted stream keyword: #{kw}"
+                end
+                @tmp_keywords.delete(dKey)
+            end
+
+            addedKeys = @tmp_keywords.keys - @currentSearchIDs
+            addedKeys.each do |aKey|
+                kw = @tmp_keywords[aKey]
+                if ( /(?:\p{Hiragana}|\p{Katakana}|[一-龠々])/ =~ kw )
+                    @searchWords.push(kw)
+                    reloadSearch = true
+                    debug "Adding search keyword: #{kw}"
+                else
+                    @filterWords.push(kw)
+                    reloadStream = true
+                    debug "Adding stream keyword: #{kw}"
+                end
+            end
+
+            (@stream_thread.kill; debug( "Streaming thread has been killed" )) if reloadStream and @stream_thread and @stream_thread.alive?
+            (@search_thread.kill; debug( "Search thread has been killed" )) if reloadSearch and @search_thread and @search_thread.alive?
+
+            if( reloadStream || reloadSearch )
+                @currentSearchIDs.clear
+                @currentSearchIDs = @tmp_keywords.keys
+
+                if( !@first_load && @notify_updates)
+                    event = "Search keywords have been updated."
+                    desc = @tmp_keywords.values.join(', ')
+                    debug "Prowling: %s %s" % [ event, desc ]
+                    notify( Unicode::E114, {
+                            :application=>"EgoProwl",
+                            :event => event,
+                            :description => desc,
+                            :priority => 0 }, 
+                            nil )
+                end
+            end
+
+            @first_load = false
+
+        rescue
+            error "Error while Getting SavedSearches: #{$!}"
+        end
+    end
+
+end
+
+## __MAIN__
+
+## command line options
+ProgramConfig = Hash.new
+opts = OptionParser.new
+opts.on( "-c", "--config FILENAME", String, "Specify the config file." ) { |v| ProgramConfig[:config] = v }
+opts.on( "-q", "--daemon",nil, "Enable daemon mode." ) { |v| ProgramConfig[:daemon] = true }
+opts.on( "-d", "--debug", nil, "Enable debug output." ) { |v| ProgramConfig[:debug] = true }
+opts.on( "-q", "--quit", nil, "Kill running process" ) { |v| ProgramConfig[:quit] = true }
+opts.on( "-a", "--auth", nil, "force (re)Auth" ) { |v| ProgramConfig[:auth] = true }
+opts.version = EGOPROWL_VERSION
+opts.program_name = "egoprowl"
+opts.parse!( ARGV )
+
+if ProgramConfig[:quit]
+    if File.exist?( PIDFILE )
+        pid = nil
+        File.open( PIDFILE ) do |fp|
+            pid = fp.readline.to_i
+        end
+        Process.kill(:INT, pid)
+        puts "Process #{pid} has been killed."
+    else
+        puts "No running process."
+    end
+    exit
+end
+
+if File.exist?( PIDFILE )
+    pid = nil
+    open( PIDFILE ) do |fp|
+        pid = fp.readline()
+    end
+    puts "Another process is seems running on #{pid}"
+    puts "kill #{pid} at first or remove pidfile: `rm #{PIDFILE}'"
+    exit
+end
+
+## config file
+config_order = [
+    File.join( ENV['HOME'], '.egoprowl.conf' ),
+    File.join( Dir.pwd, 'egoprowl.conf' ),
+    File.join( Dir.pwd, 'config.yml' ),
+    File.join( File.dirname( __FILE__ ), 'egoprowl.conf' )
+]
+
+filename = nil
+if ProgramConfig[:config]
+    if File.exist?( ProgramConfig[:config] )
+        filename = ProgramConfig[:config]
+    else
+        STDERR.print "Configuration file does not exist: #{ProgramConfig[:config]}\n"
+        exit 1
+    end
+else
+    config_order.each do |conf|
+        next unless File.exist?( conf )
+        filename = conf
+        break
+    end
+end
+
+if filename.nil?
+    STDERR.print "No configuration file exist.\n"
+    STDERR.print "File candidates are:\n"
+    STDERR.print config_order.join("\n")
+    STDERR.print "\n"
+    exit 1
+end
+
+STDOUT.print "LoadConf: #{filename}\n" 
+config = YAML.load_file( filename )
+config['Debug'] = true if ProgramConfig[:debug]
+config[:auth] = true if ProgramConfig[:auth]
+if config['LogDir']
+    logdir = config['LogDir']
+    Dir.mkdir( logdir ) unless File.exist?( logdir )
+    file = File.join( logdir, LOGFILE )
+    STDOUT.print "All logs will be written into #{file}.\n"
+    logger = Logger.new( file, 'daily' )
+    logger.level = config['Debug'] ? Logger::DEBUG : Logger::INFO
+    logger.datetime_format = "%Y-%m-%d %H:%M:%S"
+else
+    logger = nil
+end
+
+accounts = Array.new
+config['Accounts'].each do |account|
+    accounts.push( EgoProwl.new( config, account, logger ) )
+end
+
+## Daemon mode
+if ProgramConfig[:daemon] || config['Daemon'] 
+    begin
+        Process.daemon( true, true )
+    rescue
+        STDERR.print $!
+        exit 1
+    end
+    STDOUT.print "Daemonized. PID=#{Process.pid}\n"
+end
+
+Signal.trap(:INT) {
+    accounts.each do |ac| ac.shutdown end
+    File.unlink( PIDFILE ) if File.exist?( PIDFILE )
+    exit
+}
+Signal.trap(:TERM) {
+    accounts.each do |ac| ac.shutdown end
+    File.unlink( PIDFILE ) if File.exist?( PIDFILE )
+    exit
+}
+
+print "EgoProwl is running.\n"
+
+File.open( PIDFILE, "w" ) do |fp|
+    fp.write Process.pid
+end
+
+
+# main loop thread
+loop do
+    accounts.each do |ac|
+        ac.get_saved_searches
+        ac.stream_run
+        ac.search_run
+    end
+    sleep 90
+end
+
+# __END__
